@@ -10,14 +10,18 @@
 #include<vector>
 #include <algorithm>
 #include <sys/epoll.h>
+#include <set>
 
 #define OPEN_MAX 1024
 const char* host = "0.0.0.0";
+const char* invalid_name = "invalid name! try again";
 int port = 7000;
 struct client_node;
-std::vector<client_node> client_list;
-std::mutex client_lock;
-void private_message(int client_socket, const char *inmsg, const char* my_name , char *outmsg);
+static std::vector<client_node> client_list;
+static std::set<int> client_fd_set;
+static std::mutex client_lock;
+static void private_message(int client_socket, const char *inmsg, const char* my_name , char *outmsg);
+static void instruction(const char* inmsg, int sender, char *outmsg);
 struct client_node{
     int socket;
     char name[128];
@@ -29,7 +33,7 @@ struct client_node{
 
 // send message to every one except for the sender
 // if sender ==-1 send to everyone
-void broaddcast(char* outmsg, int sender){
+static void broaddcast(char* outmsg, int sender){
     if(sender == -1){
         for(auto &client:client_list){
             send(client.socket, outmsg, strlen(outmsg), 0);
@@ -44,18 +48,13 @@ void broaddcast(char* outmsg, int sender){
     }
 }
 // insert the client name and the corrsponding fd to client list
-void insert_client(int sock_fd, const char* s, int epoll_fd, epoll_event* listen_fd){
+static void insert_client(int sock_fd, const char* name){
     std::lock_guard<std::mutex> lock(client_lock);
-    client_list.emplace_back(sock_fd, s);
-    listen_fd -> events = EPOLLIN;
-    listen_fd -> data.fd = sock_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock_fd, listen_fd) == -1) {
-        perror("epoll_ctl failed");
-        close(sock_fd);
-    }
+    client_list.emplace_back(sock_fd, name);
+    client_fd_set.insert(sock_fd);
 }
 // remove the disconnect client from client list
-void remove_client(int client_socket, int epoll_fd, epoll_event* listen_fd, char *outmsg){
+static void remove_client(int client_socket, int epoll_fd, epoll_event* listen_fd, char *outmsg){
     char name[128] = {0};
     //char outmsg[1152] = {0};
     for(auto &client:client_list){
@@ -67,6 +66,7 @@ void remove_client(int client_socket, int epoll_fd, epoll_event* listen_fd, char
     client_list.erase(
         std::remove_if(client_list.begin(), client_list.end(), [&](const client_node &c){return c.socket==client_socket;})
         ,client_list.end());
+    client_fd_set.erase(client_socket);
     if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_socket, listen_fd) == -1) {
         perror("epoll_ctl failed");
     }
@@ -74,7 +74,7 @@ void remove_client(int client_socket, int epoll_fd, epoll_event* listen_fd, char
     
 }
 //handing new message the send to target client
-void new_message(const char* inmsg, int sender, char *outmsg){
+static void new_message(const char* inmsg, int sender, char *outmsg){
     char name[128] = {0};
     //char outmsg[1152] = {0};
     for(auto &client:client_list){
@@ -85,14 +85,38 @@ void new_message(const char* inmsg, int sender, char *outmsg){
     if(inmsg[0] == '@'){
         private_message(sender,inmsg, name, outmsg);
     }
+    else if(inmsg[0] == '-'){
+        instruction(inmsg, sender, outmsg);
+    }
     else{
         sprintf(outmsg, "%s: %s", name, inmsg);
         broaddcast(outmsg, sender);
     }
-    
+}
+static bool name_validity(const char* name){
+    int len = strlen(name);
+    for(int i = 0 ; i < len; i++){
+        if(name[i] == ' ') return false;
+    }
+    for(const auto &node: client_list){
+        if(strcmp(node.name,name)==0){
+            return false;
+        }
+    }
+    return true;
+}
+static bool user_exist(int client_fd){
+    if(client_fd_set.find(client_fd) != client_fd_set.end()) return true;
+    else return false;
+    // for(const auto &node: client_list){
+    //     if(node.socket == client_fd){
+    //         return true;
+    //     }
+    // }
+    // return false;
 }
 //if it's a pm, search the client list to find the fd
-void private_message(int client_socket, const char *inmsg, const char* my_name , char *outmsg){
+static void private_message(int client_socket, const char *inmsg, const char* my_name , char *outmsg){
     char target_name[128] = {0};
     if(strlen(inmsg)>1) 
         sscanf((char*)(inmsg)+1, "%s", target_name);
@@ -114,17 +138,42 @@ void private_message(int client_socket, const char *inmsg, const char* my_name ,
     }
 }
 //handling new connection, waiting the name of the client(first message from client)
-void new_connection(int client_socket, int epoll_fd, epoll_event* listen_fd){
-    char inmsg[1024] = {0};
-    char name[128] = {0};
+static void new_connection(int client_socket, const char *name){
+    // char inmsg[1024] = {0};
+    // char name[128] = {0};
     char outbuf[1152] = {0};
     // receive new client name
-    int nbytes = recv(client_socket, name, sizeof(name), 0);
-    insert_client(client_socket, name, epoll_fd, listen_fd);
-    printf("%s jointed\n", name);
-    sprintf(outbuf, "%s jointed\nNumber of connected: %ld", name, client_list.size());
-    broaddcast(outbuf, -1);
+    bool name_valid = name_validity(name);
+    if(!name_valid){
+        send(client_socket, invalid_name, strlen(invalid_name), 0);
+    }
+    else{
+        insert_client(client_socket, name);
+        printf("%s jointed\n", name);
+        sprintf(outbuf, "%s jointed\nNumber of connected: %ld", name, client_list.size());
+        broaddcast(outbuf, -1);
+    }
+    
 }
+static void instruction(const char* inmsg, int sender, char *outmsg){
+    size_t pos = 0;
+    size_t buf_size = sizeof(outmsg);
+    if(strcmp(inmsg, "-user") == 0){
+        for(const auto &node: client_list){
+            if(pos + strlen(node.name) + 1 >= buf_size){
+                printf("buffer overflow\n");
+                break;
+            }
+            memcpy(outmsg + pos, node.name, strlen(node.name));
+            pos += strlen(node.name);
+            outmsg[pos] = ' ';
+            pos++;
+        }
+        outmsg[pos-1] = 0;
+        send(sender, outmsg, sizeof(outmsg), 0);
+    }
+}
+
 
 int main()
 {   
@@ -193,10 +242,15 @@ int main()
                 struct sockaddr_in client_addr;
                 addlen = sizeof(client_addr);
                 int new_fd = accept(sock_fd, (struct sockaddr *)&client_addr, &addlen);
-                std:: thread handler(new_connection,new_fd, epoll_fd, &listen_fd);
-                handler.detach();
-                printf("connected by %s:%d\n", inet_ntoa(client_addr.sin_addr),
-                ntohs(client_addr.sin_port));
+                // std:: thread handler(new_connection,new_fd, epoll_fd, &listen_fd);
+                // handler.detach();
+                listen_fd.events = EPOLLIN;
+                listen_fd.data.fd = new_fd;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &listen_fd) == -1) {
+                    perror("epoll_ctl failed");
+                    close(sock_fd);
+                }
+                else printf("connected by %s:%d\n", inet_ntoa(client_addr.sin_addr),ntohs(client_addr.sin_port));
             }
             else{
                 int client_fd = events[i].data.fd;
@@ -207,7 +261,15 @@ int main()
                     printf("fd: %d Disconnected.\n", client_fd);
                     close(client_fd);
                 }
-                else new_message(indata, client_fd, outbuf);
+                else{
+                    if(user_exist(client_fd)){
+                        new_message(indata, client_fd, outbuf);
+                    }
+                    else{
+                        new_connection(client_fd, indata);
+                    }
+                    
+                } 
             }
         }
     }
